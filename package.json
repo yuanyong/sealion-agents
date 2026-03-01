@@ -42,6 +42,11 @@
     "viewer:dev": "lsof -ti:5174 | xargs kill -9 2>/dev/null; vite dev --config apps/viewer/vite.config.ts --open /s/tz5-13I84pwK_he",
     "viewer:build": "vite build --config apps/viewer/vite.config.ts",
     "viewer:preview": "vite preview --config apps/viewer/vite.config.ts",
+    "web:dev": "concurrently --names server,client \"cd apps/web && bun run dev:server\" \"cd apps/web && bun run dev:client\"",
+    "web:dev:server": "cd apps/web && bun run dev:server",
+    "web:dev:client": "cd apps/web && bun run dev:client",
+    "web:build": "cd apps/web && bun run build",
+    "web:start": "cd apps/web && bun run start",
     "marketing:dev": "vite dev --config apps/marketing/vite.config.ts",
     "marketing:build": "vite build --config apps/marketing/vite.config.ts",
     "marketing:preview": "vite preview --config apps/marketing/vite.config.ts",
@@ -125,6 +130,7 @@
     "semver": "^7.7.3",
     "shiki": "^3.19.0",
     "tailwind-merge": "^3.4.0",
+    "hono": "^4.7.0",
     "zod": "^4.0.0"
   }
 }
