@@ -21,6 +21,9 @@ import { homedir } from 'os'
 import { randomUUID } from 'crypto'
 import { execSync } from 'child_process'
 
+// Import sandbox manager for cloud VM isolation (E2B)
+import { SandboxManager, type SandboxManagerConfig, type SandboxProviderType } from '@craft-agent/shared/sandbox'
+
 // Import shared packages (same business logic as Electron main process)
 import {
   loadStoredConfig,
@@ -81,6 +84,34 @@ const sessions = new Map<string, WebSession>()
 
 function createSessionId(): string {
   return randomUUID().replace(/-/g, '').slice(0, 16)
+}
+
+// ─── Sandbox Manager ────────────────────────────────────────────────
+// Provides per-session cloud sandbox VMs for isolated agent tool execution.
+// Configured via environment variables:
+//   SANDBOX_PROVIDER=e2b (default)
+//   E2B_API_KEY=... (required for E2B)
+//   SANDBOX_TIMEOUT=300000 (idle timeout in ms, default 5 min)
+//   SANDBOX_TEMPLATE=base (E2B template, default 'base')
+
+const sandboxConfig: SandboxManagerConfig = {
+  provider: (Bun.env.SANDBOX_PROVIDER ?? 'e2b') as SandboxProviderType,
+  defaults: {
+    apiKey: Bun.env.E2B_API_KEY,
+    template: Bun.env.SANDBOX_TEMPLATE,
+    timeoutMs: parseInt(Bun.env.SANDBOX_TIMEOUT || '300000'),
+  },
+  idleTimeoutMs: parseInt(Bun.env.SANDBOX_IDLE_TIMEOUT || '600000'), // 10 min idle
+}
+
+const sandboxManager = Bun.env.E2B_API_KEY
+  ? new SandboxManager(sandboxConfig)
+  : null
+
+if (sandboxManager) {
+  console.log(`[Sandbox] E2B sandbox manager initialized (provider=${sandboxConfig.provider})`)
+} else {
+  console.log('[Sandbox] No E2B_API_KEY set — sandbox disabled, agent tools run locally')
 }
 
 // ─── Hono App ──────────────────────────────────────────────────────────
@@ -153,9 +184,13 @@ app.post('/api/sessions/sub', async (c) => {
   return c.json(session)
 })
 
-app.post('/api/sessions/:id/delete', (c) => {
+app.post('/api/sessions/:id/delete', async (c) => {
   const id = c.req.param('id')
   sessions.delete(id)
+  // Destroy associated sandbox (if any)
+  if (sandboxManager) {
+    await sandboxManager.destroy(id).catch(() => {})
+  }
   broadcast('session:event', { type: 'session_deleted', sessionId: id })
   return c.json({ success: true })
 })
@@ -842,6 +877,33 @@ app.get('/api/automations/last-executed', (c) => {
   return c.json({})
 })
 
+// ─── Sandbox endpoints ──────────────────────────────────────────────────
+
+app.get('/api/sandbox/:sessionId/status', async (c) => {
+  const sessionId = c.req.param('sessionId')
+  if (!sandboxManager) {
+    return c.json({ enabled: false, status: 'disabled' })
+  }
+  const provider = sandboxManager.get(sessionId)
+  if (!provider) {
+    return c.json({ enabled: true, status: 'not_created', sandboxId: null })
+  }
+  const alive = await provider.isAlive().catch(() => false)
+  return c.json({
+    enabled: true,
+    status: alive ? 'running' : 'dead',
+    sandboxId: provider.getId(),
+  })
+})
+
+app.get('/api/sandbox/info', (c) => {
+  return c.json({
+    enabled: !!sandboxManager,
+    provider: sandboxConfig.provider,
+    activeSandboxes: sandboxManager?.size ?? 0,
+  })
+})
+
 // ─── Static file serving (production) ──────────────────────────────────
 
 if (Bun.env.NODE_ENV === 'production') {
@@ -904,12 +966,29 @@ server.fetch = function (req: Request, server: { upgrade: (req: Request) => bool
   return app.fetch(req)
 } as typeof server.fetch
 
+// ─── Graceful shutdown ──────────────────────────────────────────────────
+// Destroy all sandboxes when the server shuts down to free E2B resources.
+
+async function shutdown(signal: string) {
+  console.log(`\n[Server] ${signal} received, shutting down...`)
+  if (sandboxManager) {
+    console.log(`[Sandbox] Destroying ${sandboxManager.size} active sandboxes...`)
+    await sandboxManager.destroyAll()
+    console.log('[Sandbox] All sandboxes destroyed')
+  }
+  process.exit(0)
+}
+
+process.on('SIGINT', () => shutdown('SIGINT'))
+process.on('SIGTERM', () => shutdown('SIGTERM'))
+
 console.log(`
 ╔══════════════════════════════════════════════╗
 ║        Craft Agents Web Server               ║
 ║                                              ║
 ║   HTTP:  http://localhost:${PORT}              ║
 ║   WS:    ws://localhost:${PORT}/ws             ║
+║   Sandbox: ${sandboxManager ? 'ENABLED (E2B)' : 'DISABLED'}                     ║
 ║                                              ║
 ║   Client dev: http://localhost:3000           ║
 ╚══════════════════════════════════════════════╝
