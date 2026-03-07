@@ -24,6 +24,25 @@ import { execSync } from 'child_process'
 // Import sandbox manager for cloud VM isolation (E2B)
 import { SandboxManager, type SandboxManagerConfig, type SandboxProviderType } from '@craft-agent/shared/sandbox'
 
+// Import agent backend factory and types
+import {
+  createBackendFromConnection,
+  resolveSessionConnection,
+  resolveBackendContext,
+  testBackendConnection,
+  providerTypeToAgentProvider,
+  type AgentBackend,
+} from '@craft-agent/shared/agent/backend'
+
+// Import credential manager for secure API key storage
+import { getCredentialManager } from '@craft-agent/shared/credentials'
+
+// Import model registry
+import { getModelsForProviderType, type LlmProviderType } from '@craft-agent/shared/config/llm-connections'
+import { ANTHROPIC_MODELS, DEFAULT_MODEL, getModelShortName } from '@craft-agent/shared/config/models'
+
+import type { BackendHostRuntimeContext } from '@craft-agent/shared/agent/backend'
+
 // Import shared packages (same business logic as Electron main process)
 import {
   loadStoredConfig,
@@ -78,9 +97,16 @@ interface WebSession {
   updatedAt: number
   parentSessionId?: string
   metadata?: Record<string, unknown>
+  // LLM connection & model (locked after first message)
+  llmConnection?: string   // Connection slug
+  model?: string           // Model ID
+  connectionLocked?: boolean
 }
 
 const sessions = new Map<string, WebSession>()
+
+// Per-session agent instances (lazy-created on first message)
+const agents = new Map<string, AgentBackend>()
 
 function createSessionId(): string {
   return randomUUID().replace(/-/g, '').slice(0, 16)
@@ -112,6 +138,12 @@ if (sandboxManager) {
   console.log(`[Sandbox] E2B sandbox manager initialized (provider=${sandboxConfig.provider})`)
 } else {
   console.log('[Sandbox] No E2B_API_KEY set — sandbox disabled, agent tools run locally')
+}
+
+// Host runtime context for backend operations
+const hostRuntime: BackendHostRuntimeContext = {
+  appRootPath: resolve(__dirname, '../../..'),
+  isPackaged: Bun.env.NODE_ENV === 'production',
 }
 
 // ─── Hono App ──────────────────────────────────────────────────────────
@@ -187,6 +219,12 @@ app.post('/api/sessions/sub', async (c) => {
 app.post('/api/sessions/:id/delete', async (c) => {
   const id = c.req.param('id')
   sessions.delete(id)
+  // Destroy associated agent (if any)
+  const agent = agents.get(id)
+  if (agent) {
+    try { await agent.destroy() } catch { /* ignore */ }
+    agents.delete(id)
+  }
   // Destroy associated sandbox (if any)
   if (sandboxManager) {
     await sandboxManager.destroy(id).catch(() => {})
@@ -218,38 +256,194 @@ app.post('/api/sessions/:id/message', async (c) => {
     message: userMsg,
   })
 
-  // TODO: In production, this is where you'd invoke the agent SDK
-  // For now, echo back a placeholder response
-  setTimeout(() => {
-    const assistantMsg = {
+  // Run agent chat in background (non-blocking — events stream via WebSocket)
+  runAgentChat(id, session, message).catch(err => {
+    console.error(`[Agent] Error in session ${id}:`, err)
+    const errorMsg = {
       id: randomUUID(),
       role: 'assistant',
-      content: `[Web Server] Received your message. Agent integration pending.\n\nYour message: "${message}"`,
+      content: `Error: ${String(err)}`,
       timestamp: Date.now(),
     }
-    session.messages.push(assistantMsg)
+    session.messages.push(errorMsg)
     session.status = 'idle'
-    session.updatedAt = Date.now()
-
-    broadcast('session:event', {
-      type: 'message_added',
-      sessionId: id,
-      message: assistantMsg,
-    })
-    broadcast('session:event', {
-      type: 'complete',
-      sessionId: id,
-    })
-  }, 500)
+    broadcast('session:event', { type: 'message_added', sessionId: id, message: errorMsg })
+    broadcast('session:event', { type: 'complete', sessionId: id })
+  })
 
   return c.json({ success: true })
 })
 
-app.post('/api/sessions/:id/cancel', (c) => {
+// ─── Agent lifecycle ─────────────────────────────────────────────────
+
+/**
+ * Get or create an agent for a session.
+ * Uses the session's llmConnection (or global default) to determine provider.
+ */
+async function getOrCreateAgent(session: WebSession): Promise<AgentBackend> {
+  const existing = agents.get(session.id)
+  if (existing) return existing
+
+  // Resolve workspace
+  const defaultWorkspace: Workspace = { id: 'default', name: 'Default', rootPath: homedir(), createdAt: Date.now() }
+  let workspace: Workspace
+  try {
+    const config = loadStoredConfig()
+    workspace = config?.workspaces?.find((w: Workspace) => w.id === session.workspaceId)
+      ?? config?.workspaces?.[0]
+      ?? defaultWorkspace
+  } catch {
+    workspace = defaultWorkspace
+  }
+
+  // Resolve connection: session → global default
+  const connectionSlug = session.llmConnection || getDefaultLlmConnection() || undefined
+  const model = session.model || undefined
+
+  // Create agent via factory (uses BackendConfig internally)
+  const agent = createBackendFromConnection(
+    connectionSlug ?? '',
+    {
+      workspace,
+      model,
+      session: {
+        id: session.id,
+        workspaceRootPath: workspace.rootPath,
+      } as any,
+      isHeadless: false,
+      envOverrides: {},
+      sandboxManager: sandboxManager ?? undefined,
+    },
+  )
+
+  // Wire callbacks — stream agent events to WebSocket clients
+  agent.onPermissionRequest = (request) => {
+    broadcast('session:event', {
+      type: 'permission_request',
+      sessionId: session.id,
+      request,
+    })
+  }
+
+  agent.onDebug = (msg) => {
+    console.log(`[Agent:${session.id}] ${msg}`)
+  }
+
+  // Initialize auth (injects API key / OAuth token into process.env)
+  const initResult = await agent.postInit()
+  if (!initResult.authInjected && initResult.authWarning) {
+    console.warn(`[Agent:${session.id}] Auth warning: ${initResult.authWarning}`)
+  }
+
+  // Lock connection after first agent creation
+  if (connectionSlug && !session.connectionLocked) {
+    session.llmConnection = connectionSlug
+    session.connectionLocked = true
+  }
+
+  agents.set(session.id, agent)
+  return agent
+}
+
+/**
+ * Run agent chat and stream events via WebSocket.
+ */
+async function runAgentChat(sessionId: string, session: WebSession, message: string) {
+  const agent = await getOrCreateAgent(session)
+
+  let fullText = ''
+
+  for await (const event of agent.chat(message)) {
+    // Forward all events to WebSocket clients
+    broadcast('session:event', {
+      type: 'agent_event',
+      sessionId,
+      event,
+    })
+
+    switch (event.type) {
+      case 'text_delta':
+        fullText += event.text
+        break
+
+      case 'text_complete':
+        fullText = event.text
+        break
+
+      case 'tool_start':
+        broadcast('session:event', {
+          type: 'tool_start',
+          sessionId,
+          toolName: event.toolName,
+          toolUseId: event.toolUseId,
+          input: event.input,
+        })
+        break
+
+      case 'tool_result':
+        broadcast('session:event', {
+          type: 'tool_result',
+          sessionId,
+          toolUseId: event.toolUseId,
+          result: event.result,
+          isError: event.isError,
+        })
+        break
+
+      case 'error':
+      case 'typed_error':
+        const errorText = event.type === 'error' ? event.message : `Error: ${JSON.stringify(event.error)}`
+        broadcast('session:event', {
+          type: 'error',
+          sessionId,
+          message: errorText,
+        })
+        break
+    }
+  }
+
+  // Store assistant message
+  if (fullText) {
+    const assistantMsg = {
+      id: randomUUID(),
+      role: 'assistant',
+      content: fullText,
+      timestamp: Date.now(),
+    }
+    session.messages.push(assistantMsg)
+    broadcast('session:event', {
+      type: 'message_added',
+      sessionId,
+      message: assistantMsg,
+    })
+  }
+
+  session.status = 'idle'
+  session.updatedAt = Date.now()
+  broadcast('session:event', { type: 'complete', sessionId })
+
+  // Auto-generate title after first message
+  if (session.messages.filter(m => m.role === 'user').length === 1) {
+    try {
+      const title = await agent.generateTitle(message)
+      if (title) {
+        session.name = title
+        broadcast('session:event', { type: 'session_updated', sessionId, updates: { name: title } })
+      }
+    } catch { /* title generation is best-effort */ }
+  }
+}
+
+app.post('/api/sessions/:id/cancel', async (c) => {
   const id = c.req.param('id')
   const session = sessions.get(id)
   if (session) {
     session.status = 'idle'
+    // Abort running agent
+    const agent = agents.get(id)
+    if (agent) {
+      try { await agent.abort('User cancelled') } catch { /* ignore */ }
+    }
     broadcast('session:event', { type: 'interrupted', sessionId: id })
   }
   return c.json({ success: true })
@@ -332,10 +526,37 @@ app.post('/api/sessions/:id/attachment', async (c) => {
 })
 
 app.get('/api/sessions/:id/model', (c) => {
-  return c.json(null)
+  const session = sessions.get(c.req.param('id'))
+  if (!session) return c.json(null)
+  return c.json({
+    model: session.model || null,
+    connectionSlug: session.llmConnection || null,
+    locked: session.connectionLocked || false,
+  })
 })
 
 app.post('/api/sessions/:id/model', async (c) => {
+  const id = c.req.param('id')
+  const session = sessions.get(id)
+  if (!session) return c.json({ success: false, error: 'Session not found' }, 404)
+
+  // Cannot change model/connection after first message
+  if (session.connectionLocked) {
+    return c.json({ success: false, error: 'Connection locked after first message' })
+  }
+
+  const { model, connectionSlug } = await c.req.json()
+  if (model !== undefined) session.model = model
+  if (connectionSlug !== undefined) session.llmConnection = connectionSlug
+  session.updatedAt = Date.now()
+
+  // Destroy any existing agent so it gets recreated with new settings
+  const existingAgent = agents.get(id)
+  if (existingAgent) {
+    try { await existingAgent.destroy() } catch { /* ignore */ }
+    agents.delete(id)
+  }
+
   return c.json({ success: true })
 })
 
@@ -347,7 +568,7 @@ try { loadStoredConfig() } catch { /* first launch */ }
 app.get('/api/workspaces', (c) => {
   try {
     const config = loadStoredConfig()
-    return c.json(config.workspaces || [])
+    return c.json(config?.workspaces || [])
   } catch {
     return c.json([])
   }
@@ -356,7 +577,7 @@ app.get('/api/workspaces', (c) => {
 app.post('/api/workspaces', async (c) => {
   const { folderPath, name } = await c.req.json()
   try {
-    const workspace = addWorkspace(folderPath, name)
+    const workspace = addWorkspace({ name: name || folderPath, rootPath: folderPath })
     return c.json(workspace)
   } catch (e) {
     return c.json({ error: String(e) }, 400)
@@ -574,17 +795,54 @@ app.get('/api/files/open', async (c) => {
 
 // ─── Auth endpoints ────────────────────────────────────────────────────
 
-app.get('/api/auth/state', (c) => {
-  return c.json({ authenticated: false, type: 'none' })
+app.get('/api/auth/state', async (c) => {
+  try {
+    const connections = getLlmConnections()
+    const credManager = getCredentialManager()
+
+    // Check if any connection has stored credentials
+    for (const conn of connections) {
+      const apiKey = await credManager.getLlmApiKey(conn.slug)
+      if (apiKey) {
+        return c.json({ authenticated: true, type: 'api_key', connectionSlug: conn.slug })
+      }
+    }
+    return c.json({ authenticated: false, type: 'none' })
+  } catch {
+    return c.json({ authenticated: false, type: 'none' })
+  }
 })
 
-app.get('/api/auth/setup-needs', (c) => {
-  // Return setup needs - indicates API key is needed
-  return c.json({
-    needsLlmConnection: true,
-    needsWorkspace: true,
-    availableConnections: [],
-  })
+app.get('/api/auth/setup-needs', async (c) => {
+  try {
+    const config = loadStoredConfig()
+    const connections = getLlmConnections()
+    const credManager = getCredentialManager()
+
+    const hasWorkspace = !!(config?.workspaces && config.workspaces.length > 0)
+
+    // Check if at least one connection is authenticated
+    let hasAuthenticatedConnection = false
+    for (const conn of connections) {
+      const apiKey = await credManager.getLlmApiKey(conn.slug)
+      if (apiKey) {
+        hasAuthenticatedConnection = true
+        break
+      }
+    }
+
+    return c.json({
+      needsLlmConnection: connections.length === 0 || !hasAuthenticatedConnection,
+      needsWorkspace: !hasWorkspace,
+      availableConnections: connections.map(c => ({ slug: c.slug, name: c.name, providerType: c.providerType })),
+    })
+  } catch {
+    return c.json({
+      needsLlmConnection: true,
+      needsWorkspace: true,
+      availableConnections: [],
+    })
+  }
 })
 
 app.get('/api/auth/credential-health', (c) => {
@@ -658,15 +916,26 @@ app.get('/api/llm/connections', (c) => {
   }
 })
 
-app.get('/api/llm/connections-with-status', (c) => {
+app.get('/api/llm/connections-with-status', async (c) => {
   try {
     const connections = getLlmConnections()
-    // Add status info (simplified for web)
-    const withStatus = connections.map(conn => ({
-      ...conn,
-      status: 'unknown' as const,
-      authenticated: false,
-      models: [],
+    const credManager = getCredentialManager()
+
+    const withStatus = await Promise.all(connections.map(async (conn) => {
+      let authenticated = false
+      try {
+        const hasKey = await credManager.getLlmApiKey(conn.slug)
+        authenticated = !!hasKey
+      } catch { /* ignore */ }
+
+      const models = getModelsForProviderType(conn.providerType, conn.piAuthProvider)
+
+      return {
+        ...conn,
+        status: authenticated ? 'ready' : 'needs_auth',
+        authenticated,
+        models,
+      }
     }))
     return c.json(withStatus)
   } catch {
@@ -683,8 +952,31 @@ app.get('/api/llm/connections/:slug', (c) => {
   }
 })
 
-app.get('/api/llm/connections/:slug/api-key', (c) => {
-  return c.json(null) // API keys should be handled securely
+app.get('/api/llm/connections/:slug/api-key', async (c) => {
+  try {
+    const credManager = getCredentialManager()
+    const apiKey = await credManager.getLlmApiKey(c.req.param('slug'))
+    return c.json(apiKey)
+  } catch {
+    return c.json(null)
+  }
+})
+
+app.post('/api/llm/connections/:slug/api-key', async (c) => {
+  const slug = c.req.param('slug')
+  const { apiKey } = await c.req.json()
+  try {
+    const credManager = getCredentialManager()
+    if (apiKey) {
+      await credManager.setLlmApiKey(slug, apiKey)
+    } else {
+      await credManager.deleteLlmApiKey(slug)
+    }
+    broadcast('llm:connectionsChanged', null)
+    return c.json({ success: true })
+  } catch (e) {
+    return c.json({ success: false, error: String(e) })
+  }
 })
 
 app.post('/api/llm/connections/save', async (c) => {
@@ -708,8 +1000,30 @@ app.post('/api/llm/connections/:slug/delete', (c) => {
   }
 })
 
-app.post('/api/llm/connections/:slug/test', (c) => {
-  return c.json({ success: false, error: 'Connection testing not yet implemented for web' })
+app.post('/api/llm/connections/:slug/test', async (c) => {
+  const slug = c.req.param('slug')
+  try {
+    const conn = getLlmConnection(slug)
+    if (!conn) return c.json({ success: false, error: 'Connection not found' })
+
+    const credManager = getCredentialManager()
+    const apiKey = await credManager.getLlmApiKey(slug) || ''
+    const provider = providerTypeToAgentProvider(conn.providerType)
+    const model = conn.defaultModel || 'claude-sonnet-4-5-20250929'
+
+    const result = await testBackendConnection({
+      provider,
+      apiKey,
+      model,
+      baseUrl: conn.baseUrl,
+      hostRuntime,
+      timeoutMs: 15000,
+      connection: conn,
+    })
+    return c.json(result)
+  } catch (e) {
+    return c.json({ success: false, error: String(e) })
+  }
 })
 
 app.post('/api/llm/connections/set-default', async (c) => {
@@ -726,14 +1040,24 @@ app.post('/api/llm/setup', async (c) => {
   const setup = await c.req.json()
   try {
     // Store the LLM connection config
+    const providerType: LlmProviderType = setup.providerType || (setup.slug?.includes('anthropic') ? 'anthropic' : 'anthropic_compat')
     const connection: LlmConnection = {
       slug: setup.slug,
-      type: 'api_key',
-      provider: setup.slug.includes('anthropic') ? 'anthropic' : 'custom',
+      name: setup.name || setup.slug,
+      providerType,
+      authType: setup.authType || 'api_key',
       baseUrl: setup.baseUrl || undefined,
       defaultModel: setup.defaultModel || undefined,
+      createdAt: Date.now(),
     }
     addLlmConnection(connection)
+
+    // Store API key if provided
+    if (setup.apiKey) {
+      const credManager = getCredentialManager()
+      await credManager.setLlmApiKey(setup.slug, setup.apiKey)
+    }
+
     broadcast('llm:connectionsChanged', null)
     return c.json({ success: true })
   } catch (e) {
@@ -742,7 +1066,21 @@ app.post('/api/llm/setup', async (c) => {
 })
 
 app.post('/api/llm/test-setup', async (c) => {
-  return c.json({ success: false, error: 'Connection testing not yet implemented for web' })
+  const { slug, apiKey, model, baseUrl, providerType } = await c.req.json()
+  try {
+    const provider = providerTypeToAgentProvider(providerType || 'anthropic')
+    const result = await testBackendConnection({
+      provider,
+      apiKey: apiKey || '',
+      model: model || 'claude-sonnet-4-5-20250929',
+      baseUrl,
+      hostRuntime,
+      timeoutMs: 15000,
+    })
+    return c.json(result)
+  } catch (e) {
+    return c.json({ success: false, error: String(e) })
+  }
 })
 
 app.get('/api/llm/pi/providers', (c) => {
@@ -971,6 +1309,13 @@ server.fetch = function (req: Request, server: { upgrade: (req: Request) => bool
 
 async function shutdown(signal: string) {
   console.log(`\n[Server] ${signal} received, shutting down...`)
+  // Destroy all active agents
+  if (agents.size > 0) {
+    console.log(`[Agent] Destroying ${agents.size} active agents...`)
+    await Promise.allSettled(Array.from(agents.values()).map(a => a.destroy()))
+    agents.clear()
+    console.log('[Agent] All agents destroyed')
+  }
   if (sandboxManager) {
     console.log(`[Sandbox] Destroying ${sandboxManager.size} active sandboxes...`)
     await sandboxManager.destroyAll()
