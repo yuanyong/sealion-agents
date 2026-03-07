@@ -62,6 +62,8 @@ import {
 import { type ThinkingLevel, getThinkingTokens, DEFAULT_THINKING_LEVEL } from './thinking-levels.ts';
 import type { LoadedSource } from '../sources/types.ts';
 import { sourceNeedsAuthentication } from '../sources/credential-manager.ts';
+import type { SandboxManager } from '../sandbox/sandbox-manager.ts';
+import { createSandboxMcpServer, SANDBOXED_TOOLS, TOOL_REDIRECT_MAP } from '../sandbox/sandbox-mcp-server.ts';
 import type {
   AgentBackend,
   ChatOptions,
@@ -138,6 +140,8 @@ export interface ClaudeAgentConfig {
   mcpPool?: McpClientPool;
   /** LLM connection slug for credential lookup in postInit(). */
   connectionSlug?: string;
+  /** Sandbox manager for executing agent tools in isolated cloud VMs (web mode). */
+  sandboxManager?: SandboxManager;
 }
 
 // Permission request tracking
@@ -405,6 +409,7 @@ export class ClaudeAgent extends BaseAgent {
       mcpPool: config.mcpPool,
       connectionSlug: config.connectionSlug,
       automationSystem: config.automationSystem,
+      sandboxManager: config.sandboxManager,
     };
 
     // Call BaseAgent constructor - initializes model, thinkingLevel, permissionManager, sourceManager, etc.
@@ -662,6 +667,21 @@ export class ClaudeAgent extends BaseAgent {
         debug('[chat] Source proxy servers created for', sourceProxyCount, 'sources');
       }
 
+      // Build sandbox MCP server if sandbox manager is available (web mode)
+      // This provides sandbox_bash, sandbox_read, sandbox_write, sandbox_edit, sandbox_glob, sandbox_grep
+      // tools that execute inside an isolated cloud VM instead of on the host
+      let sandboxMcpServer: ReturnType<typeof createSandboxMcpServer> | null = null;
+      if (this.config.sandboxManager) {
+        try {
+          const sandboxProvider = await this.config.sandboxManager.getOrCreate(sessionId);
+          sandboxMcpServer = createSandboxMcpServer(sandboxProvider);
+          debug('[chat] Sandbox MCP server created for session', sessionId);
+        } catch (err) {
+          debug('[chat] Failed to create sandbox:', String(err));
+          // Continue without sandbox — tools will execute locally
+        }
+      }
+
       // Build full MCP servers set first, then filter for mini agents
       const fullMcpServers: Options['mcpServers'] = {
         // Session-scoped tools (SubmitPlan, source_test, update_user_preferences, transform_data, etc.)
@@ -676,6 +696,8 @@ export class ClaudeAgent extends BaseAgent {
         // Each source gets its own SDK server keyed by slug (e.g., 'linear', 'github', 'gmail')
         // so the SDK produces correct tool names: mcp__{slug}__{toolName}
         ...sourceProxies,
+        // Sandbox tools for isolated execution in cloud VMs (web mode)
+        ...(sandboxMcpServer ? { sandbox: sandboxMcpServer } : {}),
       };
 
       // Mini agents: filter to minimal set using centralized keys
@@ -809,6 +831,20 @@ export class ClaudeAgent extends BaseAgent {
               // Get current permission mode (single source of truth)
               const permissionMode = getPermissionMode(sessionId);
               this.onDebug?.(`PreToolUse hook: ${input.tool_name} (permissionMode=${permissionMode})`);
+
+              // Sandbox tool redirection: when a sandbox is active, redirect built-in
+              // file/command tools to their sandbox equivalents (e.g., Bash → sandbox_bash)
+              if (sandboxMcpServer && SANDBOXED_TOOLS.has(input.tool_name)) {
+                const sandboxTool = TOOL_REDIRECT_MAP[input.tool_name];
+                if (sandboxTool) {
+                  this.onDebug?.(`[sandbox] Redirecting ${input.tool_name} → ${sandboxTool}`);
+                  return blockWithReason(
+                    `This environment uses cloud sandboxing. Use the sandbox tool instead: ${sandboxTool}. ` +
+                    `For example, instead of the ${input.tool_name} tool, use the equivalent mcp__sandbox__sandbox_${input.tool_name.toLowerCase()} tool ` +
+                    `which executes in an isolated cloud VM.`
+                  );
+                }
+              }
 
               const toolInput = input.tool_input as Record<string, unknown>;
 

@@ -1,0 +1,82 @@
+@import "tailwindcss";
+@plugin "@tailwindcss/typography";
+
+/* Tell Tailwind where to scan for utility classes - includes the shared electron renderer components */
+@source "../../../electron/src/renderer/**/*.{tsx,ts,jsx,js}";
+@source "../../../../packages/ui/src/**/*.{tsx,ts,jsx,js}";
+@source "./**/*.{tsx,ts,jsx,js}";
+
+/* =============================================================================
+   ANIMATABLE CSS CUSTOM PROPERTIES
+
+   Register theme color variables as animatable using @property.
+   This enables smooth transitions when themes change.
+============================================================================= */
+
+@property --background {
+  syntax: "<color>";
+  inherits: true;
+  initial-value: oklch(0.98 0.003 265);
+}
+
+@property --foreground {
+  syntax: "<color>";
+  inherits: true;
+  initial-value: oklch(0.185 0.01 270);
+}
+
+@property --accent {
+  syntax: "<color>";
+  inherits: true;
+  initial-value: oklch(0.62 0.13 293);
+}
+
+@property --info {
+  syntax: "<color>";
+  inherits: true;
+  initial-value: oklch(0.65 0.16 70);
+}
+
+@property --success {
+  syntax: "<color>";
+  inherits: true;
+  initial-value: oklch(0.55 0.17 145);
+}
+
+@property --destructive {
+  syntax: "<color>";
+  inherits: true;
+  initial-value: oklch(0.55 0.22 27);
+}
+
+@property --muted-foreground {
+  syntax: "<color>";
+  inherits: true;
+  initial-value: oklch(0.55 0.01 265);
+}
+
+@property --border {
+  syntax: "<color>";
+  inherits: true;
+  initial-value: oklch(0.88 0.005 265);
+}
+
+/* =============================================================================
+   WEB-SPECIFIC STYLES
+============================================================================= */
+
+html, body, #root {
+  height: 100%;
+  margin: 0;
+  padding: 0;
+  overflow: hidden;
+}
+
+body {
+  font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+/* Remove Electron-specific window chrome styles */
+/* No drag region needed for web */

@@ -19,6 +19,7 @@ import type { PermissionMode } from '../mode-manager.ts';
 import type { LoadedSource } from '../../sources/types.ts';
 import type { AuthRequest } from '../session-scoped-tools.ts';
 import type { McpClientPool } from '../../mcp/mcp-pool.ts';
+import type { SandboxManager } from '../../sandbox/sandbox-manager.ts';
 import type { Workspace } from '../../config/storage.ts';
 import type { SessionConfig as Session } from '../../sessions/storage.ts';
 import type { SourceManager } from '../core/source-manager.ts';
@@ -553,6 +554,9 @@ export interface BackendConfig extends CoreBackendConfig {
 
   /** Workspace-level automation system for user-defined SDK hooks (automations.json) */
   automationSystem?: AutomationSystem;
+
+  /** Sandbox manager for executing agent tools in isolated cloud VMs (web mode). */
+  sandboxManager?: SandboxManager;
 
   /**
    * Opaque runtime payload resolved by backend drivers.
